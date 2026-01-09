@@ -99,6 +99,7 @@ class PA2:
         self.debug = debug
 
         self.errors: queue.Queue[str] = queue.Queue()
+        self.threadExceptions: queue.Queue[Exception] = queue.Queue()
 
         self.networkThread = None
         self.inputQueueThread = None
@@ -149,6 +150,12 @@ class PA2:
         """Queue a debug message"""
         tsError = f"{datetime.now()}: {e}"
         self.errors.put(tsError)
+
+    def _checkThreadExceptions(self) -> None:
+        """Check if any exceptions occurred in background threads and raise them."""
+        if not self.threadExceptions.empty():
+            exception = self.threadExceptions.get()
+            raise exception
 
     def __enter__(self) -> Self:
         return self
@@ -307,6 +314,7 @@ class PA2:
         while self.connected and not (
             self.handshake and self.authenticated and self.validated
         ):
+            self._checkThreadExceptions()
             threading.Event().wait(1)
             if (
                 self._hasConnectedTime()
@@ -372,7 +380,8 @@ class PA2:
         self.blockStarted: datetime = datetime.now()
         self._dprint(f"Blocking query started at {self.blockStarted}")
         while not self.blockError and (self.blockingForList or len(self.blockList) > 0):
-            pass
+            self._checkThreadExceptions()
+            threading.Event().wait(0.1)
 
         if self.blockError:
             if self.blockingForList:
@@ -405,32 +414,37 @@ class PA2:
         if self._hasBlockStartTime():
             blockStartCache = self.blockStarted
 
-        while self.connected or not self.connected and not self.inputQueue.empty():
-            if not self.inputQueue.empty():
-                message = self.inputQueue.get()
-                self._parseMessage(message, mode=mode)
+        try:
+            while self.connected or not self.connected and not self.inputQueue.empty():
+                if not self.inputQueue.empty():
+                    message = self.inputQueue.get()
+                    self._parseMessage(message, mode=mode)
 
-            # Check for a timeout on blocked commands.
-            # If timeout and max retries are not reached, requeue the command
-            if self._hasBlockStartTime():
-                blockStartCache = self.blockStarted
-                if (datetime.now() - blockStartCache).total_seconds() > self.timeout:
-                    if not self.blockRetried:
-                        self._dprint("Blocking query timed out, not yet retried")
-                        for target, command in self.blockList.items():
-                            self._dprint(f"Retrying {target}")
-                            self._queueCommand(command, block=False)
+                # Check for a timeout on blocked commands.
+                # If timeout and max retries are not reached, requeue the command
+                if self._hasBlockStartTime():
+                    blockStartCache = self.blockStarted
+                    if (datetime.now() - blockStartCache).total_seconds() > self.timeout:
+                        if not self.blockRetried:
+                            self._dprint("Blocking query timed out, not yet retried")
+                            for target, command in self.blockList.items():
+                                self._dprint(f"Retrying {target}")
+                                self._queueCommand(command, block=False)
 
-                        self.blockStarted = datetime.now()
-                        self.blockRetried = True
-                    else:
-                        self._dprint(
-                            f"Blocking query timed out, retries exhausted. Remaining targets: {self.blockList.keys()}"
-                        )
+                            self.blockStarted = datetime.now()
+                            self.blockRetried = True
+                        else:
+                            self._dprint(
+                                f"Blocking query timed out, retries exhausted. Remaining targets: {self.blockList.keys()}"
+                            )
 
-                        self.blockError = True
+                            self.blockError = True
 
-        self._dprint("Exiting input queue loop")
+            self._dprint("Exiting input queue loop")
+        except Exception as e:
+            self._dprint(f"Exception in input queue processing: {e}")
+            self.threadExceptions.put(e)
+            self._disconnect()
 
     def _queueCommand(self, command: list[str], block: bool = False) -> None:
         """Queue a command to be sent to the device.
@@ -520,7 +534,7 @@ class PA2:
                             self.authenticated = True
                         elif message.startswith(dr.ProtoConnectFail):
                             self._disconnect()
-                            raise ConnectionError("Authentication failed")
+                            self.threadExceptions.put(ConnectionError("Authentication failed"))
                     else:
                         # authenticated
                         self._processCommand(message)
