@@ -531,6 +531,25 @@ class PA2:
                                     f"{xo.ProtoCrossover}\\{dr.ProtoAttr}",
                                 ]
                             )
+                            # Subscribe to mute state changes
+                            self._queueCommand(
+                                [dr.ProtoSub, f"{ob.ProtoMutes}\\{dr.ProtoValues}\\{ob.MuteLowL}"]
+                            )
+                            self._queueCommand(
+                                [dr.ProtoSub, f"{ob.ProtoMutes}\\{dr.ProtoValues}\\{ob.MuteLowR}"]
+                            )
+                            self._queueCommand(
+                                [dr.ProtoSub, f"{ob.ProtoMutes}\\{dr.ProtoValues}\\{ob.MuteMidL}"]
+                            )
+                            self._queueCommand(
+                                [dr.ProtoSub, f"{ob.ProtoMutes}\\{dr.ProtoValues}\\{ob.MuteMidR}"]
+                            )
+                            self._queueCommand(
+                                [dr.ProtoSub, f"{ob.ProtoMutes}\\{dr.ProtoValues}\\{ob.MuteHighL}"]
+                            )
+                            self._queueCommand(
+                                [dr.ProtoSub, f"{ob.ProtoMutes}\\{dr.ProtoValues}\\{ob.MuteHighR}"]
+                            )
                             self.authenticated = True
                         elif message.startswith(dr.ProtoConnectFail):
                             self._disconnect()
