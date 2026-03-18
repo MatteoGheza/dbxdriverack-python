@@ -46,6 +46,9 @@ ProtoName = "\\\\Node\\AT\\Instance_Name"
 ProtoVersion = "\\\\Node\\AT\\Software_Version"
 Preset = "\\\\Preset"
 
+MuteChangeCallback = Callable[[str, str, bool], None]
+PresetChangeCallback = Callable[[int, Optional[str]], None]
+
 
 class PA2Device:
     """Represents a DriveRack PA2 device's model, name, and other characteristics.
@@ -151,6 +154,11 @@ class PA2:
         self.presetNames: dict[int, str] = {}
         # currentPreset will be set dynamically when received from device
 
+        # Realtime state-change callbacks
+        self._callbackLock = threading.Lock()
+        self._muteChangeCallbacks: list[MuteChangeCallback] = []
+        self._presetChangeCallbacks: list[PresetChangeCallback] = []
+
     def _dprint(self, e: str) -> None:
         """Queue a debug message"""
         tsError = f"{datetime.now()}: {e}"
@@ -161,6 +169,64 @@ class PA2:
         if not self.threadExceptions.empty():
             exception = self.threadExceptions.get()
             raise exception
+
+    def registerMuteChangeCallback(self, callback: MuteChangeCallback) -> None:
+        """Register a callback for mute-state changes.
+
+        The callback receives (band, channel, muted).
+        """
+
+        with self._callbackLock:
+            if callback not in self._muteChangeCallbacks:
+                self._muteChangeCallbacks.append(callback)
+
+    def unregisterMuteChangeCallback(self, callback: MuteChangeCallback) -> None:
+        """Unregister a mute-state callback."""
+
+        with self._callbackLock:
+            if callback in self._muteChangeCallbacks:
+                self._muteChangeCallbacks.remove(callback)
+
+    def registerPresetChangeCallback(self, callback: PresetChangeCallback) -> None:
+        """Register a callback for current-preset changes.
+
+        The callback receives (preset_number, preset_name_or_none).
+        """
+
+        with self._callbackLock:
+            if callback not in self._presetChangeCallbacks:
+                self._presetChangeCallbacks.append(callback)
+
+    def unregisterPresetChangeCallback(self, callback: PresetChangeCallback) -> None:
+        """Unregister a current-preset callback."""
+
+        with self._callbackLock:
+            if callback in self._presetChangeCallbacks:
+                self._presetChangeCallbacks.remove(callback)
+
+    def _notifyMuteChange(self, band: str, channel: str, muted: bool) -> None:
+        """Invoke all registered mute-state callbacks."""
+
+        with self._callbackLock:
+            callbacks = list(self._muteChangeCallbacks)
+
+        for callback in callbacks:
+            try:
+                callback(band, channel, muted)
+            except Exception as e:
+                self._dprint(f"Mute callback error: {e}")
+
+    def _notifyPresetChange(self, preset_num: int, preset_name: Optional[str]) -> None:
+        """Invoke all registered current-preset callbacks."""
+
+        with self._callbackLock:
+            callbacks = list(self._presetChangeCallbacks)
+
+        for callback in callbacks:
+            try:
+                callback(preset_num, preset_name)
+            except Exception as e:
+                self._dprint(f"Preset callback error: {e}")
 
     def __enter__(self) -> Self:
         return self
@@ -835,17 +901,41 @@ class PA2:
                     self.name = command[2]
                 elif command[1].startswith(f"{ob.ProtoMutes}\\{dr.ProtoValues}"):
                     if command[1].endswith(ob.MuteLowL):
-                        self.muteLowLeft: bool = command[2] == ob.MuteEnabled
+                        self._setMuteState(
+                            ob.BandLow,
+                            dr.ChannelLeft,
+                            command[2] == ob.MuteEnabled,
+                        )
                     elif command[1].endswith(ob.MuteLowR):
-                        self.muteLowRight: bool = command[2] == ob.MuteEnabled
+                        self._setMuteState(
+                            ob.BandLow,
+                            dr.ChannelRight,
+                            command[2] == ob.MuteEnabled,
+                        )
                     elif command[1].endswith(ob.MuteMidL):
-                        self.muteMidLeft: bool = command[2] == ob.MuteEnabled
+                        self._setMuteState(
+                            ob.BandMid,
+                            dr.ChannelLeft,
+                            command[2] == ob.MuteEnabled,
+                        )
                     elif command[1].endswith(ob.MuteMidR):
-                        self.muteMidRight: bool = command[2] == ob.MuteEnabled
+                        self._setMuteState(
+                            ob.BandMid,
+                            dr.ChannelRight,
+                            command[2] == ob.MuteEnabled,
+                        )
                     elif command[1].endswith(ob.MuteHighL):
-                        self.muteHighLeft: bool = command[2] == ob.MuteEnabled
+                        self._setMuteState(
+                            ob.BandHigh,
+                            dr.ChannelLeft,
+                            command[2] == ob.MuteEnabled,
+                        )
                     elif command[1].endswith(ob.MuteHighR):
-                        self.muteHighRight: bool = command[2] == ob.MuteEnabled
+                        self._setMuteState(
+                            ob.BandHigh,
+                            dr.ChannelRight,
+                            command[2] == ob.MuteEnabled,
+                        )
                 elif (
                     command[1].startswith(f"{geq.GraphicEqSt}\\{dr.ProtoValues}")
                     or command[1].startswith(f"{geq.GraphicEqL}\\{dr.ProtoValues}")
@@ -987,7 +1077,14 @@ class PA2:
 
                     if subtarget == pst.CurrentPresetTarget:
                         try:
-                            self.currentPreset = pst.validatePresetNumber(command[2])
+                            preset_num = pst.validatePresetNumber(command[2])
+                            old_preset = getattr(self, "currentPreset", None)
+                            self.currentPreset = preset_num
+                            if old_preset is None or old_preset != preset_num:
+                                self._notifyPresetChange(
+                                    preset_num,
+                                    self.presetNames.get(preset_num),
+                                )
                         except ValueError:
                             self._dprint(f"Invalid preset number: {command[2]}")
                     elif pst.isPresetNameSubtarget(subtarget):
@@ -1322,6 +1419,48 @@ class PA2:
 
         if block:
             self._blockingQuery()
+
+    def _setMuteState(self, band: str, channel: str, muted: bool) -> None:
+        """Set local mute state and notify callbacks when it changes."""
+
+        if band == ob.BandLow and channel == dr.ChannelLeft:
+            attr_name = "muteLowLeft"
+        elif band == ob.BandLow and channel == dr.ChannelRight:
+            attr_name = "muteLowRight"
+        elif band == ob.BandMid and channel == dr.ChannelLeft:
+            attr_name = "muteMidLeft"
+        elif band == ob.BandMid and channel == dr.ChannelRight:
+            attr_name = "muteMidRight"
+        elif band == ob.BandHigh and channel == dr.ChannelLeft:
+            attr_name = "muteHighLeft"
+        elif band == ob.BandHigh and channel == dr.ChannelRight:
+            attr_name = "muteHighRight"
+        else:
+            raise ValueError("Invalid band or channel")
+
+        old_value = getattr(self, attr_name, None)
+        setattr(self, attr_name, muted)
+
+        if old_value is None or old_value != muted:
+            self._notifyMuteChange(band, channel, muted)
+
+    def _getMuteState(self, band: str, channel: str) -> bool:
+        """Get local mute state for a band+channel."""
+
+        if band == ob.BandHigh and channel == dr.ChannelLeft:
+            return self.muteHighLeft
+        elif band == ob.BandHigh and channel == dr.ChannelRight:
+            return self.muteHighRight
+        elif band == ob.BandMid and channel == dr.ChannelLeft:
+            return self.muteMidLeft
+        elif band == ob.BandMid and channel == dr.ChannelRight:
+            return self.muteMidRight
+        elif band == ob.BandLow and channel == dr.ChannelLeft:
+            return self.muteLowLeft
+        elif band == ob.BandLow and channel == dr.ChannelRight:
+            return self.muteLowRight
+        else:
+            raise ValueError("Invalid band or channel")
 
     def setGeq(
         self, geqObj: geq.PA2Geq, channel: str = dr.ChannelsStereo, apply: bool = True
@@ -2963,26 +3102,12 @@ class PA2:
 
         if channel == dr.ChannelLeft:
             targetChannel = ob.MuteL
-            if band == ob.BandHigh:
-                self.muteHighLeft = mute
-            elif band == ob.BandMid:
-                self.muteMidLeft = mute
-            elif band == ob.BandLow:
-                self.muteLowLeft = mute
-            else:
-                raise ValueError("Invalid band")
         elif channel == dr.ChannelRight:
             targetChannel = ob.MuteR
-            if band == ob.BandHigh:
-                self.muteHighRight = mute
-            elif band == ob.BandMid:
-                self.muteMidRight = mute
-            elif band == ob.BandLow:
-                self.muteLowRight = mute
-            else:
-                raise ValueError("Invalid band")
         else:
             raise ValueError("Invalid channel")
+
+        self._setMuteState(band, channel, mute)
 
         self._queueCommand(
             ob.CmdBuilder(
@@ -3085,27 +3210,15 @@ class PA2:
                 self.muteHighRight = True
 
         for band in [ob.BandHigh, ob.BandMid, ob.BandLow]:
-            for channel in [ob.MuteL, ob.MuteR]:
-                if band == ob.BandLow:
-                    muteValue = (
-                        self.muteLowLeft if channel == ob.MuteL else self.muteLowRight
-                    )
-                elif band == ob.BandMid:
-                    muteValue = (
-                        self.muteMidLeft if channel == ob.MuteL else self.muteMidRight
-                    )
-                elif band == ob.BandHigh:
-                    muteValue = (
-                        self.muteHighLeft if channel == ob.MuteL else self.muteHighRight
-                    )
-                else:
-                    raise ValueError("Invalid band")
+            for channel in [dr.ChannelLeft, dr.ChannelRight]:
+                targetChannel = ob.MuteL if channel == dr.ChannelLeft else ob.MuteR
+                muteValue = self._getMuteState(band, channel)
 
                 if action == dr.CmdMuteRefresh:
                     self._queueCommand(
                         ob.CmdBuilder(
                             dr.ProtoGet,
-                            channel,
+                            targetChannel,
                             band=band,
                         ).get(),
                         block=block,
@@ -3114,7 +3227,7 @@ class PA2:
                     self._queueCommand(
                         ob.CmdBuilder(
                             dr.ProtoSet,
-                            channel,
+                            targetChannel,
                             band=band,
                             value=muteValue,
                         ).get(),
@@ -3124,26 +3237,26 @@ class PA2:
                     self._queueCommand(
                         ob.CmdBuilder(
                             dr.ProtoSet,
-                            channel,
+                            targetChannel,
                             band=band,
                             value=True,
                         ).get(),
                         block=block,
                     )
                     if updateState:
-                        muteValue = True
+                        self._setMuteState(band, channel, True)
                 elif action == dr.CmdUnmuteAll:
                     self._queueCommand(
                         ob.CmdBuilder(
                             dr.ProtoSet,
-                            channel,
+                            targetChannel,
                             band=band,
                             value=False,
                         ).get(),
                         block=block,
                     )
                     if updateState:
-                        muteValue = False
+                        self._setMuteState(band, channel, False)
 
         if block:
             self._blockingQuery()
@@ -3181,26 +3294,7 @@ class PA2:
         if update:
             self.bulkMute(dr.CmdMuteRefresh, block=block)
 
-        if channel == dr.ChannelLeft:
-            if band == ob.BandHigh:
-                return self.muteHighLeft
-            elif band == ob.BandMid:
-                return self.muteMidLeft
-            elif band == ob.BandLow:
-                return self.muteLowLeft
-            else:
-                raise ValueError("Invalid band")
-        elif channel == dr.ChannelRight:
-            if band == ob.BandHigh:
-                return self.muteHighRight
-            elif band == ob.BandMid:
-                return self.muteMidRight
-            elif band == ob.BandLow:
-                return self.muteLowRight
-            else:
-                raise ValueError("Invalid band")
-        else:
-            raise ValueError("Invalid channel")
+        return self._getMuteState(band, channel)
 
     # Presets
 
