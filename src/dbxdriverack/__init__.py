@@ -41,6 +41,8 @@ ProtoSubResp = "subr"
 ProtoUnsub = "unsub"
 ProtoList = "ls"
 ProtoListEnd = "endls"
+ProtoSet = "set"
+ProtoSetResp = "setr"
 
 dB2float_re = re.compile(r"(-?\d+(?:\.\d+)?)\s*dB")
 freq2Hz_re = re.compile(r"(\d+(?:\.\d+)?)\s*(k?Hz)")

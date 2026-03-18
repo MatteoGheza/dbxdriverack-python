@@ -32,6 +32,7 @@ import dbxdriverack.pa2.compressor as comp
 import dbxdriverack.pa2.indelay as idly
 import dbxdriverack.pa2.rta as rta
 import dbxdriverack.pa2.generator as gen
+import dbxdriverack.pa2.preset as pst
 
 # Constants
 
@@ -145,6 +146,10 @@ class PA2:
         self.outLow = ob.PA2OutputBlock()
         self.numBands = 0
         self.lowMono = False
+
+        # Preset management
+        self.presetNames: dict[int, str] = {}
+        # currentPreset will be set dynamically when received from device
 
     def _dprint(self, e: str) -> None:
         """Queue a debug message"""
@@ -390,7 +395,7 @@ class PA2:
                 )
             else:
                 raise TimeoutError(
-                    f"Blocking query timed out waiting for {self.blockList.keys()}"
+                    f"Blocking query timed out waiting for {list(self.blockList.keys())}"
                 )
 
         self._dprint(f"Blocking query completed at {datetime.now()}")
@@ -472,18 +477,23 @@ class PA2:
                 self._dprint(f"Blocking for {target}")
 
     def _processOutputQueue(self, mode: str = "tcp") -> None:
-        while self.connected or not self.connected and not self.outputQueue.empty():
-            if not self.outputQueue.empty():
-                messageContainer = self.outputQueue.get()
-                if mode == "udp":
-                    dest, message = messageContainer
-                    self.socket.sendto(f"{message}\n".encode("utf-8"), dest)
-                else:
-                    message = messageContainer[1]
-                    self.socket.sendall(f"{message}\n".encode("utf-8"))
-                if self.debug:
-                    self._dprint(f"> {message}")
-        self._dprint("Exiting output queue loop")
+        try:
+            while self.connected or not self.connected and not self.outputQueue.empty():
+                if not self.outputQueue.empty():
+                    messageContainer = self.outputQueue.get()
+                    if mode == "udp":
+                        dest, message = messageContainer
+                        self.socket.sendto(f"{message}\n".encode("utf-8"), dest)
+                    else:
+                        message = messageContainer[1]
+                        self.socket.sendall(f"{message}\n".encode("utf-8"))
+                    if self.debug:
+                        self._dprint(f"> {message}")
+            self._dprint("Exiting output queue loop")
+        except Exception as e:
+            self._dprint(f"Exception in output queue processing: {e}")
+            self.threadExceptions.put(e)
+            self._disconnect()
 
     def _parseMessage(
         self, messageContainer: tuple[str, str], mode: str = "tcp"
@@ -550,6 +560,19 @@ class PA2:
                             self._queueCommand(
                                 [dr.ProtoSub, f"{ob.ProtoMutes}\\{dr.ProtoValues}\\{ob.MuteHighR}"]
                             )
+                            # Subscribe to current preset
+                            self._queueCommand(
+                                pst.CmdBuilder(dr.ProtoSub, pst.PresetCurrent).get()
+                            )
+                            # Fetch all preset names at startup
+                            for preset_num in range(pst.MinPresetNumber, pst.MaxPresetNumber + 1):
+                                self._queueCommand(
+                                    pst.CmdBuilder(
+                                        dr.ProtoGet,
+                                        pst.PresetName,
+                                        preset_num=preset_num,
+                                    ).get()
+                                )
                             self.authenticated = True
                         elif message.startswith(dr.ProtoConnectFail):
                             self._disconnect()
@@ -955,6 +978,24 @@ class PA2:
                         self.generator.setMode(command[2])
                     elif subtarget == gen.Level:
                         self.generator.setLevel(dr.dB2float(command[2]))
+                elif pst.isPresetValuesTargetPath(command[1]):
+                    try:
+                        subtarget = pst.getPresetSubtarget(command[1])
+                    except ValueError:
+                        self._dprint(f"Invalid preset path: {command[1]}")
+                        subtarget = ""
+
+                    if subtarget == pst.CurrentPresetTarget:
+                        try:
+                            self.currentPreset = pst.validatePresetNumber(command[2])
+                        except ValueError:
+                            self._dprint(f"Invalid preset number: {command[2]}")
+                    elif pst.isPresetNameSubtarget(subtarget):
+                        try:
+                            preset_num = pst.parsePresetNameSubtarget(subtarget)
+                            self.presetNames[preset_num] = command[2]
+                        except ValueError:
+                            self._dprint(f"Invalid preset name path: {command[1]}")
 
         # If we're currently blocking for this target,
         # indicate that we've received the response
@@ -3160,6 +3201,127 @@ class PA2:
                 raise ValueError("Invalid band")
         else:
             raise ValueError("Invalid channel")
+
+    # Presets
+
+    def recallPreset(self, preset_num: int, block: bool = True) -> None:
+        """Recall a preset on the connected PA2 device.
+
+        Parameters
+        ----------
+        preset_num : int
+            Preset number to recall (1-36)
+        block : bool, optional
+            Wait until the device confirms completion. Default True.
+
+        Raises
+        ------
+        ValueError
+            Preset number out of range
+        """
+
+        preset_num = pst.validatePresetNumber(preset_num)
+        command = pst.CmdBuilder(dr.ProtoSet, pst.PresetRecall, value=preset_num).get()
+        target_path = command[1]
+        self._queueCommand(command)
+
+        if block:
+            self.blockList[target_path] = [dr.ProtoSetResp]
+            while target_path in self.blockList:
+                time.sleep(0.01)
+
+    def recallPresetByName(self, name: str, block: bool = True) -> None:
+        """Recall a preset on the connected PA2 device by its name.
+
+        Parameters
+        ----------
+        name : str
+            Preset name to recall
+        block : bool, optional
+            Wait until the device confirms completion. Default True.
+
+        Raises
+        ------
+        ValueError
+            Preset name not found
+        """
+
+        preset_num = pst.findPresetByName(self.presetNames, name)
+        self.recallPreset(preset_num, block=block)
+
+    def getCurrentPreset(self, update: bool = True, block: bool = True) -> int:
+        """Get the currently active preset number.
+
+        Parameters
+        ----------
+        update : bool, optional
+            Query the device for the current preset. Default True.
+        block : bool, optional
+            Wait until values are received from the device. Default True.
+
+        Returns
+        -------
+        int
+            Current preset number (1-36)
+
+        Raises
+        ------
+        AttributeError
+            Current preset not known
+        """
+
+        if update:
+            command = pst.CmdBuilder(dr.ProtoGet, pst.PresetCurrent).get()
+            target_path = command[1]
+            self._queueCommand(command)
+
+            if block:
+                self.blockList[target_path] = [dr.ProtoSubResp]
+                while target_path in self.blockList:
+                    time.sleep(0.01)
+
+        return self.currentPreset
+
+    def getPresetName(self, preset_num: int, update: bool = True, block: bool = True) -> str:
+        """Get the name of a preset.
+
+        Parameters
+        ----------
+        preset_num : int
+            Preset number (1-36)
+        update : bool, optional
+            Query the device for the preset name. Default True.
+        block : bool, optional
+            Wait until values are received from the device. Default True.
+
+        Returns
+        -------
+        str
+            Preset name
+
+        Raises
+        ------
+        ValueError
+            Preset number out of range
+        KeyError
+            Preset name not known
+        """
+
+        if update:
+            command = pst.CmdBuilder(
+                dr.ProtoGet,
+                pst.PresetName,
+                preset_num=preset_num,
+            ).get()
+            target_path = command[1]
+            self._queueCommand(command)
+
+            if block:
+                self.blockList[target_path] = [dr.ProtoSubResp]
+                while target_path in self.blockList:
+                    time.sleep(0.01)
+
+        return pst.getPresetNameByNumber(self.presetNames, preset_num)
 
     # RTA
 
