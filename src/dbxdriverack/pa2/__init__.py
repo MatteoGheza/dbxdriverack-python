@@ -3209,6 +3209,11 @@ class PA2:
             except AttributeError:
                 self.muteHighRight = True
 
+        # PA2 may suppress responses for no-op mute set commands (e.g. setting
+        # an already-unmuted output to unmuted). To avoid false blocking
+        # timeouts, only block directly on refresh/get operations.
+        queue_block = block and action == dr.CmdMuteRefresh
+
         for band in [ob.BandHigh, ob.BandMid, ob.BandLow]:
             for channel in [dr.ChannelLeft, dr.ChannelRight]:
                 targetChannel = ob.MuteL if channel == dr.ChannelLeft else ob.MuteR
@@ -3221,7 +3226,7 @@ class PA2:
                             targetChannel,
                             band=band,
                         ).get(),
-                        block=block,
+                        block=queue_block,
                     )
                 elif action == dr.CmdMuteRestore:
                     self._queueCommand(
@@ -3231,7 +3236,7 @@ class PA2:
                             band=band,
                             value=muteValue,
                         ).get(),
-                        block=block,
+                        block=queue_block,
                     )
                 elif action == dr.CmdMuteAll:
                     self._queueCommand(
@@ -3241,7 +3246,7 @@ class PA2:
                             band=band,
                             value=True,
                         ).get(),
-                        block=block,
+                        block=queue_block,
                     )
                     if updateState:
                         self._setMuteState(band, channel, True)
@@ -3253,13 +3258,18 @@ class PA2:
                             band=band,
                             value=False,
                         ).get(),
-                        block=block,
+                        block=queue_block,
                     )
                     if updateState:
                         self._setMuteState(band, channel, False)
 
         if block:
-            self._blockingQuery()
+            if action == dr.CmdMuteRefresh:
+                self._blockingQuery()
+            else:
+                # Confirm final state with a blocking refresh. This is resilient
+                # when the device omits acknowledgements for no-op set commands.
+                self.bulkMute(dr.CmdMuteRefresh, block=True)
 
     def isMuted(
         self, band: str, channel: str, update: bool = True, block: bool = True
