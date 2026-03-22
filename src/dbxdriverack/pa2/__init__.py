@@ -3142,6 +3142,39 @@ class PA2:
             return False
         return True
 
+    def _iterAvailableMuteTargets(self) -> list[tuple[str, str]]:
+        """Return output band+channel pairs that exist in the current topology.
+
+        The PA2 preset topology can omit Mid or Low outputs. Blocking mute refreshes
+        must only wait on targets that can actually respond.
+        """
+
+        has_mids = self.hasMids()
+        has_subs = self.hasSubs()
+
+        bands: list[str] = [ob.BandHigh]
+        if has_mids:
+            bands.append(ob.BandMid)
+        if has_subs:
+            bands.append(ob.BandLow)
+
+        # If topology is not known yet, fall back to whichever states we have seen
+        # (plus High which is always present) to avoid querying impossible targets.
+        if self.numBands == 0:
+            if hasattr(self, "muteMidLeft") or hasattr(self, "muteMidRight"):
+                if ob.BandMid not in bands:
+                    bands.append(ob.BandMid)
+            if hasattr(self, "muteLowLeft") or hasattr(self, "muteLowRight"):
+                if ob.BandLow not in bands:
+                    bands.append(ob.BandLow)
+
+        targets: list[tuple[str, str]] = []
+        for band in bands:
+            for channel in [dr.ChannelLeft, dr.ChannelRight]:
+                targets.append((band, channel))
+
+        return targets
+
     def bulkMute(
         self, action: str, updateState: bool = True, block: bool = True
     ) -> None:
@@ -3214,8 +3247,7 @@ class PA2:
         # timeouts, only block directly on refresh/get operations.
         queue_block = block and action == dr.CmdMuteRefresh
 
-        for band in [ob.BandHigh, ob.BandMid, ob.BandLow]:
-            for channel in [dr.ChannelLeft, dr.ChannelRight]:
+        for band, channel in self._iterAvailableMuteTargets():
                 targetChannel = ob.MuteL if channel == dr.ChannelLeft else ob.MuteR
                 muteValue = self._getMuteState(band, channel)
 
@@ -3269,7 +3301,14 @@ class PA2:
             else:
                 # Confirm final state with a blocking refresh. This is resilient
                 # when the device omits acknowledgements for no-op set commands.
-                self.bulkMute(dr.CmdMuteRefresh, block=True)
+                try:
+                    self.bulkMute(dr.CmdMuteRefresh, block=True)
+                except TimeoutError as exc:
+                    # Some presets/topologies can temporarily suppress mute reads
+                    # during recall transitions. Keep local state and continue.
+                    self._dprint(
+                        f"Mute confirmation refresh timed out ({exc}); continuing"
+                    )
 
     def isMuted(
         self, band: str, channel: str, update: bool = True, block: bool = True
@@ -3326,13 +3365,10 @@ class PA2:
 
         preset_num = pst.validatePresetNumber(preset_num)
         command = pst.CmdBuilder(dr.ProtoSet, pst.PresetRecall, value=preset_num).get()
-        target_path = command[1]
-        self._queueCommand(command)
+        self._queueCommand(command, block=block)
 
         if block:
-            self.blockList[target_path] = [dr.ProtoSetResp]
-            while target_path in self.blockList:
-                time.sleep(0.01)
+            self._blockingQuery()
 
     def recallPresetByName(self, name: str, block: bool = True) -> None:
         """Recall a preset on the connected PA2 device by its name.
@@ -3376,13 +3412,10 @@ class PA2:
 
         if update:
             command = pst.CmdBuilder(dr.ProtoGet, pst.PresetCurrent).get()
-            target_path = command[1]
-            self._queueCommand(command)
+            self._queueCommand(command, block=block)
 
             if block:
-                self.blockList[target_path] = [dr.ProtoSubResp]
-                while target_path in self.blockList:
-                    time.sleep(0.01)
+                self._blockingQuery()
 
         return self.currentPreset
 
@@ -3417,13 +3450,10 @@ class PA2:
                 pst.PresetName,
                 preset_num=preset_num,
             ).get()
-            target_path = command[1]
-            self._queueCommand(command)
+            self._queueCommand(command, block=block)
 
             if block:
-                self.blockList[target_path] = [dr.ProtoSubResp]
-                while target_path in self.blockList:
-                    time.sleep(0.01)
+                self._blockingQuery()
 
         return pst.getPresetNameByNumber(self.presetNames, preset_num)
 
