@@ -155,6 +155,7 @@ class DeviceState:
         raw_store: dict[str, str] = {
             "\\Node\\AT\\Class_Name": "dbxDriveRackPA2",
             "\\Node\\AT\\Instance_Name": "My DriveRack",
+            "\\Node\\SV\\DeviceName": "My DriveRack",
             "\\Node\\AT\\Software_Version": "1.2.0.1",
             "\\Node\\Wizard\\SV\\WizardState": "Inactive",
             "\\Node\\Wizard\\SV\\LevelAssistOutput": "None",
@@ -168,6 +169,9 @@ class DeviceState:
             "\\Preset\\Crossover\\AT\\MonoSub": "0",
             "\\Preset\\SignalGenerator\\SV\\Signal Generator": "Off",
             "\\Preset\\Afs\\SV\\AFS": "On",
+            "\\Preset\\Afs\\SV\\FilterMode": "Live",
+            "\\Preset\\Afs\\SV\\FilterMode\\Min": "Fixed",
+            "\\Preset\\Afs\\SV\\FilterMode\\Max": "Live",
             "\\Preset\\StereoGEQ\\SV\\GraphicEQ": "Off",
             "\\Preset\\RoomEQ\\SV\\ParametricEQ": "On",
             "\\Preset\\SubharmonicSynth\\SV\\SubharmonicSynth": "Off",
@@ -511,6 +515,25 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         await tx(f'ls "{canon}"')
                         await tx("\t.. : ")
                         await tx("endls")
+                
+                # ── lc ──────────────────────────────────────────────────
+                elif cmd == "lc":
+                    if len(tokens) < 2:
+                        continue
+                    raw_path = tokens[1]
+                    canon = state.canonicalize(raw_path)
+
+                    if canon.startswith("\\\\Preset\\Afs\\SV\\ContentMode\\EN"):
+                        await tx(f'ls "{canon}"')
+                        await tx("\tSpeech")
+                        await tx("\tSpeech Music")
+                        await tx("\tMusic")
+                        await tx("endlc")
+                    elif canon.startswith("\\\\Preset\\Afs\\SV\\FilterMode\\EN"):
+                        await tx(f'ls "{canon}"')
+                        await tx("\tFixed")
+                        await tx("\tLive")
+                        await tx("endlc")
 
                 else:
                     log.warning("Unknown command: %r", line)
@@ -585,6 +608,7 @@ class UDPProtocol(asyncio.DatagramProtocol):
         "unsub": 1,
         "asyncget": 1,
         "ls": 1,
+        "lc": 1,
     }
 
     def __init__(self):
